@@ -1,0 +1,297 @@
+import os
+import json
+import time
+import hashlib
+import certifi
+import re
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+from pymongo import TEXT, MongoClient, UpdateOne
+from openai import OpenAI
+from anthropic import Anthropic
+from google import genai
+from pymongo.errors import OperationFailure
+
+load_dotenv()
+
+MONGO_DB = "distillena"
+SRC_COL = "generated_text"
+OUT_COL = "teacher_softlabels"
+
+
+TEACHER_PROVIDER = "openai"
+# support multiple teacher models/providers
+TEACHER_MODELS = [
+    {"provider": "openai", "model": "gpt-5.2"},
+    {"provider": "anthropic", "model": "claude-opus-4-6"},
+    {"provider": "google", "model": "gemini-3-pro-preview"},
+]
+
+
+BATCH_LIMIT = 200
+SLEEP_SECONDS = 0.15
+
+LABEL_LIST = [
+    "Lead",
+    "Position",
+    "Claim",
+    "Counterclaim",
+    "Rebuttal",
+    "Evidence",
+    "Concluding Statement",
+]
+
+def sha1_text(s: str) -> str:
+    return hashlib.sha1(s.strip().encode("utf-8")).hexdigest()
+
+def get_mongo():
+    uri = os.environ["MONGODB_URI"]
+    client = MongoClient(uri, tls=True, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=8000)
+    return client[MONGO_DB]
+
+def build_prompt(text: str) -> str:
+    labels = ", ".join(LABEL_LIST)
+    return f"""
+
+You are a classification model.
+
+You MUST output valid JSON.
+DO NOT include explanations, comments, markdown, or extra text.
+DO NOT wrap the output in ```.
+
+You are classifying a student-written sentence into the following labels:
+
+Lead
+Position
+Claim
+Counterclaim
+Rebuttal
+Evidence
+Concluding Statement
+
+Output rules:
+- Output ONE JSON object
+- Keys MUST be exactly these labels (spelling and capitalization must match)
+- Every key MUST appear exactly once
+- Values MUST be floats between 0 and 1
+- All values MUST sum to exactly 1 (small rounding error is acceptable)
+- Do NOT include any other keys
+
+Correct output example (FORMAT ONLY — values are illustrative):
+
+{{
+  "Lead": 0.10,
+  "Position": 0.15,
+  "Claim": 0.35,
+  "Counterclaim": 0.10,
+  "Rebuttal": 0.10,
+  "Evidence": 0.15,
+  "Concluding Statement": 0.05
+}}
+
+If you are uncertain, still output probabilities that sum to 1.
+If the sentence weakly matches multiple labels, distribute probabilities accordingly.
+Never output text outside the JSON object.
+
+Sentence to classify:
+"{TEXT}"
+
+""".strip()
+
+def teacher_softlabel_openai(client: OpenAI, text: str, model: str | None = None) -> dict:
+    prompt = build_prompt(text)
+    use_model = model or TEACHER_MODELS[0]["model"]
+    resp = client.chat.completions.create(
+        model=use_model,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    probs = json.loads(content)
+
+    for k in LABEL_LIST:
+        if k not in probs:
+            raise ValueError(f"Missing label: {k}")
+
+    probs = {k: float(probs[k]) for k in LABEL_LIST}
+    s = sum(probs.values())
+    if not (0.98 <= s <= 1.02):
+        raise ValueError(f"Prob sum not ~1: {s}")
+
+    return probs
+
+def main():
+    print(">>> teacher_label.py started (writing to teacher_softlabels)")
+
+    db = get_mongo()
+    src = db[SRC_COL]
+    out = db[OUT_COL]
+
+    def safe_create_index(coll, *args, **kwargs):
+        try:
+            coll.create_index(*args, **kwargs)
+        except OperationFailure as e:
+            # Mongo returns code 86 (IndexKeySpecsConflict) when an existing
+            # index with the same name/spec already exists. Ignore that.
+            if getattr(e, "code", None) == 86:
+                print(f"Index conflict for {coll.name} {args}; continuing.")
+            else:
+                raise
+
+    safe_create_index(src, "hash")
+    safe_create_index(out, "source_id")
+    safe_create_index(out, [("teacher.provider", 1), ("teacher.model", 1)])
+    safe_create_index(
+        out,
+        [("source_id", 1), ("teacher.provider", 1), ("teacher.model", 1)],
+        unique=True,
+    )
+
+    # instantiate clients for all teacher providers
+    openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    anthropic_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    gemini_client = genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"]
+)
+
+    def teacher_softlabel_dispatch(model_cfg: dict, text: str) -> dict:
+        provider = model_cfg["provider"]
+        model = model_cfg["model"]
+
+        prompt = build_prompt(text)
+
+        if provider == "openai":
+            resp = openai_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = (resp.choices[0].message.content or "").strip()
+
+        elif provider == "anthropic":
+            msg = anthropic_client.messages.create(
+                model=model,
+                max_tokens=300,
+                temperature=0.0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = "".join(block.text for block in msg.content if block.type == "text").strip()
+
+        elif provider == "google":
+            r = gemini_client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={"temperature": 0.0, "maxOutputTokens": 2048},
+            )
+            content = (r.text or "").strip()
+
+
+        else:
+            raise ValueError(f"Unknown teacher provider: {provider}")
+
+        # extract JSON from content (models may wrap response in markdown or text)
+        # try direct parse first
+        try:
+            probs = json.loads(content)
+        except json.JSONDecodeError:
+            # try extracting JSON from markdown code block
+            if "```json" in content:
+                json_str = content.split("```json")[1].split("```")[0].strip()
+                probs = json.loads(json_str)
+            elif "```" in content:
+                json_str = content.split("```")[1].split("```")[0].strip()
+                probs = json.loads(json_str)
+            else:
+                # try extracting {...} substring (greedy match)
+                match = re.search(r'\{.*\}', content, re.DOTALL)
+                if match:
+                    json_str = match.group()
+                    # if truncated (ends with comma or incomplete key), try closing it
+                    if json_str.rstrip().endswith(','):
+                        json_str = json_str.rstrip()[:-1] + "}"
+                    try:
+                        probs = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        # last resort: count open/close braces and close if needed
+                        open_count = json_str.count('{')
+                        close_count = json_str.count('}')
+                        if open_count > close_count:
+                            json_str += '}' * (open_count - close_count)
+                        try:
+                            probs = json.loads(json_str)
+                        except json.JSONDecodeError:
+                            raise ValueError(f"Could not parse JSON from response: {content[:200]}")
+                else:
+                    raise ValueError(f"Could not parse JSON from response: {content[:200]}")
+
+        for k in LABEL_LIST:
+            if k not in probs:
+                raise ValueError(f"Missing label: {k}")
+        probs = {k: float(probs[k]) for k in LABEL_LIST}
+        s = sum(probs.values())
+        if not (0.98 <= s <= 1.02):
+            raise ValueError(f"Prob sum not ~1: {s}")
+        return probs
+
+    cursor = src.find(
+        {"text": {"$type": "string", "$ne": ""}},
+        {"_id": 1, "text": 1, "label": 1, "concept": 1, "hash": 1, "provider": 1, "model": 1, "temperature": 1}
+    ).limit(BATCH_LIMIT)
+
+    n_ok, n_skip, n_fail = 0, 0, 0
+
+    for d in cursor:
+        source_id = d["_id"]
+        text = (d.get("text") or "").strip()
+        if not text:
+            continue
+        h = d.get("hash") or sha1_text(text)
+
+        # call each teacher model/provider
+        for model_cfg in TEACHER_MODELS:
+            provider = model_cfg["provider"]
+            model = model_cfg["model"]
+
+            exists = out.find_one(
+                {"source_id": source_id, "teacher.provider": provider, "teacher.model": model},
+                {"_id": 1}
+            )
+            if exists:
+                n_skip += 1
+                continue
+
+            try:
+                probs = teacher_softlabel_dispatch(model_cfg, text)
+                pred = max(probs.items(), key=lambda kv: kv[1])[0]
+                conf = probs[pred]
+            except Exception as e:
+                n_fail += 1
+                print(f"[fail] {source_id} :: {provider}/{model} :: {type(e).__name__} {e}")
+                continue
+
+            doc = {
+                "source_id": source_id,
+                "hash": h,
+                "text": text,
+                "concept": d.get("concept"),
+                "generator_model": d.get("model"),
+                "teacher": {"provider": provider, "model": model},
+                "probs": probs,
+                "pred": pred,
+                "confidence": conf,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            try:
+                out.insert_one(doc)
+                n_ok += 1
+                print(f"[ok] saved {n_ok} :: {provider}/{model} pred={pred} conf={conf:.3f}")
+            except Exception as e:
+                n_skip += 1
+                print(f"[skip] duplicate or insert error :: {type(e).__name__} {e}")
+
+            time.sleep(SLEEP_SECONDS)
+
+    print(f">>> done. ok={n_ok}, skip={n_skip}, fail={n_fail}")
+
+if __name__ == "__main__":
+    main()
