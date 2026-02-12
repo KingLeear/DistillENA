@@ -17,11 +17,11 @@ load_dotenv()
 
 MONGO_DB = "distillena"
 SRC_COL = "generated_text"
-OUT_COL = "teacher_softlabels"
+OUT_COL = "teacher_softlabels_v2"
 
 
 TEACHER_PROVIDER = "openai"
-# support multiple teacher models/providers
+# multiple teacher models
 TEACHER_MODELS = [
     {"provider": "openai", "model": "gpt-5.2"},
     {"provider": "anthropic", "model": "claude-opus-4-6"},
@@ -29,7 +29,7 @@ TEACHER_MODELS = [
 ]
 
 
-BATCH_LIMIT = 200
+BATCH_LIMIT = None
 SLEEP_SECONDS = 0.15
 
 LABEL_LIST = [
@@ -51,7 +51,6 @@ def get_mongo():
     return client[MONGO_DB]
 
 def build_prompt(text: str) -> str:
-    labels = ", ".join(LABEL_LIST)
     return f"""
 
 You are a classification model.
@@ -62,13 +61,24 @@ DO NOT wrap the output in ```.
 
 You are classifying a student-written sentence into the following labels:
 
-Lead
-Position
-Claim
-Counterclaim
-Rebuttal
-Evidence
-Concluding Statement
+Lead: "The introduction begins with a statistic, a quotation, a description, or some other device to grab the reader’s attention and point toward the thesis."
+Position: "An opinion on the main question",
+Claim: "A claim that supports the position."
+Counterclaim: "A claim that refutes another claim or gives an opposing reason to the position.",
+Rebuttal: "A claim that refutes a counterclaim."
+Evidence: "Ideas or examples that support claims, counterclaims, or rebuttals."
+Concluding Statement: "A concluding statement that restates the claims."
+
+Decision logic (follow strictly):
+1) First decide the sentence FUNCTION, not keywords.
+2) If it is an opening hook without stating a stance → Lead.
+3) If it clearly states a stance/opinion/should-claim on the main issue → Position.
+4) If it gives a reason that supports the stance (often starts with "because", "one reason", "this is why") → Claim.
+5) If it presents an opposing view → Counterclaim.
+6) If it refutes that opposing view → Rebuttal.
+7) If it provides a concrete example/data/source/event/case → Evidence.
+8) If it summarizes/closes/reaffirms at the end → Concluding Statement.
+9) If multiple apply, distribute probability (but keep the most plausible label highest).
 
 Output rules:
 - Output ONE JSON object
@@ -80,22 +90,20 @@ Output rules:
 
 Correct output example (FORMAT ONLY — values are illustrative):
 
-{{
-  "Lead": 0.10,
+{
+  {"Lead": 0.10,
   "Position": 0.15,
   "Claim": 0.35,
   "Counterclaim": 0.10,
   "Rebuttal": 0.10,
   "Evidence": 0.15,
-  "Concluding Statement": 0.05
-}}
-
-If you are uncertain, still output probabilities that sum to 1.
+  "Concluding Statement": 0.05}
+}
+Please DO close the brackets!
 If the sentence weakly matches multiple labels, distribute probabilities accordingly.
 Never output text outside the JSON object.
 
-Sentence to classify:
-"{TEXT}"
+Sentence to classify:{text}
 
 """.strip()
 
@@ -131,8 +139,7 @@ def main():
         try:
             coll.create_index(*args, **kwargs)
         except OperationFailure as e:
-            # Mongo returns code 86 (IndexKeySpecsConflict) when an existing
-            # index with the same name/spec already exists. Ignore that.
+
             if getattr(e, "code", None) == 86:
                 print(f"Index conflict for {coll.name} {args}; continuing.")
             else:
@@ -235,7 +242,10 @@ def main():
     cursor = src.find(
         {"text": {"$type": "string", "$ne": ""}},
         {"_id": 1, "text": 1, "label": 1, "concept": 1, "hash": 1, "provider": 1, "model": 1, "temperature": 1}
-    ).limit(BATCH_LIMIT)
+    )
+
+    if BATCH_LIMIT:
+        cursor = cursor.limit(BATCH_LIMIT)
 
     n_ok, n_skip, n_fail = 0, 0, 0
 
@@ -274,11 +284,13 @@ def main():
                 "text": text,
                 "concept": d.get("concept"),
                 "generator_model": d.get("model"),
-                "teacher": {"provider": provider, "model": model},
+                "teacher": {
+                    "provider": model_cfg["provider"],
+                    "model": model_cfg["model"],
+                },
                 "probs": probs,
                 "pred": pred,
                 "confidence": conf,
-                "created_at": datetime.now(timezone.utc).isoformat(),
             }
 
             try:
