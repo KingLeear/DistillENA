@@ -39,7 +39,7 @@ LABEL_LIST = [
     "Counterclaim",
     "Rebuttal",
     "Evidence",
-    "Concluding Statement",
+    "Concluding Statement ",
 ]
 
 def sha1_text(s: str) -> str:
@@ -187,7 +187,7 @@ def main():
             r = gemini_client.models.generate_content(
                 model=model,
                 contents=prompt,
-                config={"temperature": 0.0, "maxOutputTokens": 2048},
+                config={"temperature": 0.0, "maxOutputTokens": 2048,  "responseMimeType": "application/json"},
             )
             content = (r.text or "").strip()
 
@@ -199,6 +199,19 @@ def main():
         # try direct parse first
         try:
             probs = json.loads(content)
+
+            for k in LABEL_LIST:
+                if k not in probs:
+                    probs[k] = 0.0
+
+            # Renormalize to sum to 1
+            total = sum(probs.values())
+            if total > 0:
+                probs = {k: v / total for k, v in probs.items()}
+            else:
+                # All zeros; give equal weight
+                probs = {k: 1.0 / len(LABEL_LIST) for k in LABEL_LIST}
+            
         except json.JSONDecodeError:
             # try extracting JSON from markdown code block
             if "```json" in content:
@@ -208,26 +221,29 @@ def main():
                 json_str = content.split("```")[1].split("```")[0].strip()
                 probs = json.loads(json_str)
             else:
-                # try extracting {...} substring (greedy match)
-                match = re.search(r'\{.*\}', content, re.DOTALL)
-                if match:
-                    json_str = match.group()
-                    # if truncated (ends with comma or incomplete key), try closing it
-                    if json_str.rstrip().endswith(','):
-                        json_str = json_str.rstrip()[:-1] + "}"
-                    try:
-                        probs = json.loads(json_str)
-                    except json.JSONDecodeError:
-                        # last resort: count open/close braces and close if needed
-                        open_count = json_str.count('{')
-                        close_count = json_str.count('}')
-                        if open_count > close_count:
-                            json_str += '}' * (open_count - close_count)
-                        try:
-                            probs = json.loads(json_str)
-                        except json.JSONDecodeError:
-                            raise ValueError(f"Could not parse JSON from response: {content[:200]}")
+    # safer JSON extraction (brace matching instead of greedy regex)
+                start = content.find("{")
+                if start == -1:
+                    raise ValueError(f"Could not parse JSON from response: {content[:200]}")
+
+                depth = 0
+                for i in range(start, len(content)):
+                    if content[i] == "{":
+                        depth += 1
+                    elif content[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            json_str = content[start:i+1]
+                            break
                 else:
+                    # if never properly closed, auto-close
+                    json_str = content[start:] + "}" * depth
+
+                json_str = re.sub(r",\s*}", "}", json_str)  # remove trailing comma
+
+                try:
+                    probs = json.loads(json_str)
+                except json.JSONDecodeError:
                     raise ValueError(f"Could not parse JSON from response: {content[:200]}")
 
         for k in LABEL_LIST:
