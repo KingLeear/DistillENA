@@ -79,8 +79,8 @@ LABEL_SPECS = {
         ]
     },
 
-    "Concluding Statement ": {
-        "concept": "Concluding Statement ",
+    "Concluding Statement": {
+        "concept": "Concluding Statement",
         "definition": "A concluding statement that restates the claims.",
         "examples": [
             "To sum up, thinking seriously is important in making decisions because each decision has an outcome that affects lives. It is also important because if you think seriously it can help you succeed",
@@ -116,18 +116,7 @@ client_db = MongoClient(
 
 db = client_db["distillena"]
 col = db["generated_text"]
-try:
-    col.create_index("hash", unique=True)
-except Exception as e:
-    try:
-        from pymongo.errors import OperationFailure
-    except Exception:
-        OperationFailure = None
-
-    if OperationFailure and isinstance(e, OperationFailure) and getattr(e, "code", None) == 86:
-        print("Index 'hash' already exists (conflict); continuing.")
-    else:
-        raise
+col.create_index("hash", unique=True)
 
 
 
